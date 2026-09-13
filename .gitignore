@@ -1,0 +1,7 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+AGENTS.md
+memory/*.json.tmp
+# logs/ НЕ игнорируется: runs.jsonl — часть сдачи

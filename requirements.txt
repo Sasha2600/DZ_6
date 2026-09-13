@@ -1,0 +1,3 @@
+openai==3.13.0
+python-dotenv==1.2.2
+qdrant-client==1.19.0
