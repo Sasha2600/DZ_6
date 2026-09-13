@@ -34,7 +34,7 @@ TF-IDF-эмбеддером, поэтому самодиагностика ра�
     .venv/bin/python agent.py                 # интерактив
     .venv/bin/python agent.py "вопрос"         # один вопрос (+ строка метрик)
     .venv/bin/python agent.py --demo           # 4 прогона + сводная таблица
-    .venv/bin/python agent.py --selftest       # 10 проверок без LLM
+    .venv/bin/python agent.py --selftest       # 12 проверок без LLM
     .venv/bin/python agent.py --report         # агрегаты по logs/runs.jsonl
     .venv/bin/python agent.py --show-trace "вопрос"
 """
@@ -96,6 +96,16 @@ LLM_MAX_RETRIES = int(os.getenv("LLM_MAX_RETRIES", "2"))
 MAX_ANSWER_CHARS = int(os.getenv("MAX_ANSWER_CHARS", "2000"))
 # Лог выполнения (JSONL, одна строка на прогон) — часть сдачи.
 RUNS_LOG_FILE = os.getenv("RUNS_LOG_FILE", "logs/runs.jsonl")
+# Максимум записей в логе: при переполнении файл ротируется в <файл>.1
+# (хранится один архив). 0 — ротация выключена.
+RUNS_LOG_MAX_RECORDS = int(os.getenv("RUNS_LOG_MAX_RECORDS", "1000"))
+# Тариф за 1 000 000 токенов в рублях — для метрики cost_rub (локальной
+# модели это оценочный тариф облачного эквивалента). Входные (prompt) и
+# выходные (completion) токены тарифицируются отдельно.
+LLM_COST_INPUT_PER_1M_RUB = float(os.getenv("LLM_COST_INPUT_PER_1M_RUB", "15"))
+LLM_COST_OUTPUT_PER_1M_RUB = float(os.getenv("LLM_COST_OUTPUT_PER_1M_RUB", "60"))
+# Порог доли эскалаций (0..1): выше — алерт (по умолчанию 0.2 — более 20% прогонов).
+ERROR_ALERT_THRESHOLD = float(os.getenv("ERROR_ALERT_THRESHOLD", "0.2"))
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "ERROR")
 logger = logging.getLogger("dz6.agent")
@@ -170,8 +180,8 @@ class AgentResult:
 class RunMetrics:
     """Метрики одного прогона: успех, длительность, стоимость, ретраи.
 
-    Стоимость — в LLM-вызовах и токенах (денежного тарифа нет: локальная
-    модель); формула расширяема — добавь rate в __post_init__.
+    Стоимость — в рублях (cost_rub): входные и выходные токены тарифицируются
+    отдельно по тарифам за 1M токенов (LLM_COST_*_PER_1M_RUB).
     """
     duration_s: float = 0.0
     llm_calls: int = 0
@@ -184,6 +194,16 @@ class RunMetrics:
     @property
     def total_tokens(self) -> int:
         return self.prompt_tokens + self.completion_tokens
+
+    @property
+    def cost_rub(self) -> float:
+        """Стоимость прогона в рублях: входные и выходные токены по отдельным
+        тарифам за 1 000 000 токенов."""
+        return round(
+            self.prompt_tokens * LLM_COST_INPUT_PER_1M_RUB / 1_000_000
+            + self.completion_tokens * LLM_COST_OUTPUT_PER_1M_RUB / 1_000_000,
+            6,
+        )
 
     @property
     def success(self) -> bool:
@@ -1038,17 +1058,34 @@ def _execute(query: str, workflow: Workflow,
 # --------------------------------------------------------------------------- #
 
 class RunLog:
-    """Лог выполнения: JSONL, одна JSON-строка на прогон, append-режим."""
+    """Лог выполнения: JSONL, одна JSON-строка на прогон, append-режим.
 
-    def __init__(self, path: str) -> None:
+    Ротация: когда записей становится >= max_records, файл переименовывается
+    в <файл>.1 (предыдущий архив не сохраняется), и лог начинается заново —
+    runs.jsonl не растёт бесконечно. max_records <= 0 — ротация выключена.
+    """
+
+    def __init__(self, path: str, max_records: int = RUNS_LOG_MAX_RECORDS) -> None:
         self.path = path
+        self.max_records = max_records
 
     def append(self, record: dict[str, Any]) -> None:
+        self._rotate_if_needed()
         d = os.path.dirname(self.path)
         if d:
             os.makedirs(d, exist_ok=True)
         with open(self.path, "a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    def _rotate_if_needed(self) -> None:
+        if self.max_records <= 0 or not os.path.exists(self.path):
+            return
+        if len(self.read()) < self.max_records:
+            return
+        archive = self.path + ".1"
+        if os.path.exists(archive):
+            os.remove(archive)
+        os.replace(self.path, archive)
 
     def read(self) -> list[dict[str, Any]]:
         if not os.path.exists(self.path):
@@ -1082,6 +1119,7 @@ def log_run(run_log: RunLog, query: str, result: AgentResult,
             "completion": metrics.completion_tokens,
             "total": metrics.total_tokens,
         },
+        "cost_rub": metrics.cost_rub,
         "retries": metrics.retries,
         "memory_saved": result.memory_saved,
         "sources": result.sources,
@@ -1112,21 +1150,23 @@ def print_metrics(metrics: RunMetrics) -> None:
     print(
         f"Метрики: {metrics.duration_s:.2f}с | LLM-вызовов: {metrics.llm_calls} | "
         f"токены: {metrics.total_tokens} (prompt={metrics.prompt_tokens}, "
-        f"completion={metrics.completion_tokens}) | ретраев: {metrics.retries}"
+        f"completion={metrics.completion_tokens}) | стоимость: {metrics.cost_rub:.4f}₽ "
+        f"| ретраев: {metrics.retries}"
     )
 
 
 def print_metrics_table(runs: list[tuple[str, AgentResult, RunMetrics]]) -> None:
-    """Сводная таблица «прогон × метрики» + агрегаты (конец --demo)."""
+    """Сводная таблица «прогон × метрики» + агрегаты + алерт (конец --demo)."""
     if not runs:
         return
     print("\n===== Сводка метрик =====")
-    print(f"{'№':<4}{'результат':<18}{'LLM':>5}{'токены':>9}{'время':>10}{'ретраи':>9}  комментарий")
+    print(f"{'№':<4}{'результат':<18}{'LLM':>5}{'токены':>9}{'время':>10}{'ретраи':>9}"
+          f"{'стоимость':>12}  комментарий")
     for i, (comment, result, m) in enumerate(runs, 1):
         note = result.escalated_reason or comment
         print(
             f"{i:<4}{result.outcome.value:<18}{m.llm_calls:>5}{m.total_tokens:>9}"
-            f"{m.duration_s:>9.2f}с{m.retries:>9}  {note}"
+            f"{m.duration_s:>9.2f}с{m.retries:>9}{m.cost_rub:>11.4f}₽  {note}"
         )
     total = len(runs)
     ok = sum(1 for _, r, _ in runs if r.outcome in (Outcome.ANSWERED, Outcome.ANSWERED_CACHED))
@@ -1134,9 +1174,33 @@ def print_metrics_table(runs: list[tuple[str, AgentResult, RunMetrics]]) -> None
     errors = sum(1 for _, r, _ in runs if r.outcome == Outcome.ESCALATED)
     avg = sum(m.duration_s for _, _, m in runs) / total
     tokens = sum(m.total_tokens for _, _, m in runs)
+    cost = sum(m.cost_rub for _, _, m in runs)
     retries = sum(m.retries for _, _, m in runs)
     print(f"Успешность: {ok}/{total} ({ok * 100 / total:.1f}%) | отказов: {refused} | ошибок: {errors}")
-    print(f"Среднее время: {avg:.2f}с | суммарные токены: {tokens} | ретраев: {retries}")
+    print(f"Среднее время: {avg:.2f}с | суммарные токены: {tokens} | "
+          f"стоимость: {cost:.4f}₽ | ретраев: {retries}")
+    alert = check_error_alert(errors, total)
+    if alert:
+        print(alert)
+
+
+def check_error_alert(escalated: int, total: int,
+                      threshold: float = ERROR_ALERT_THRESHOLD) -> Optional[str]:
+    """Алерт: доля прогонов, завершившихся эскалацией, выше порога.
+
+    Порог по умолчанию 0.2 (20%): например, в демо из 4 прогонов одна
+    запланированная эскалация (high_risk) — 25% — уже превышает порог;
+    при большом числе прогонов случайные сбои будут заметнее.
+    """
+    if total == 0 or threshold <= 0:
+        return None
+    share = escalated / total
+    if share > threshold:
+        return (
+            f"[АЛЕРТ] {share * 100:.1f}% прогонов завершилось эскалацией "
+            f"(порог {threshold * 100:.0f}%) — проверьте LLM и конфигурацию"
+        )
+    return None
 
 
 def report(path: str) -> int:
@@ -1151,27 +1215,34 @@ def report(path: str) -> int:
         by_outcome.setdefault(str(rec.get("outcome", "unknown")), []).append(rec)
     ok = sum(len(v) for k, v in by_outcome.items() if k in ("answered", "answered_cached"))
     print(f"Отчёт по логам выполнения: {path} (всего {total} прогонов)")
-    print(f"{'результат':<18}{'прогонов':>9}{'доля':>9}{'среднее время':>16}{'токенов':>11}")
+    print(f"{'результат':<18}{'прогонов':>9}{'доля':>9}{'среднее время':>16}"
+          f"{'токенов':>11}{'стоимость':>13}")
     for outcome in ("answered", "answered_cached", "refused", "escalated"):
         recs = by_outcome.get(outcome)
         if not recs:
             continue
         avg = sum(r.get("duration_s", 0) for r in recs) / len(recs)
         tokens = sum(r.get("tokens", {}).get("total", 0) for r in recs)
+        cost = sum(r.get("cost_rub", 0) for r in recs)
         print(f"{outcome:<18}{len(recs):>9}{len(recs) * 100 / total:>8.1f}%"
-              f"{avg:>15.2f}с{tokens:>11}")
+              f"{avg:>15.2f}с{tokens:>11}{cost:>12.4f}₽")
     for other, recs in by_outcome.items():
         if other in ("answered", "answered_cached", "refused", "escalated"):
             continue
         print(f"{other:<18}{len(recs):>9}{len(recs) * 100 / total:>8.1f}%"
-              f"{'—':>16}{'—':>11}")
+              f"{'—':>16}{'—':>11}{'—':>13}")
     total_dur = sum(r.get("duration_s", 0) for r in records)
     total_tok = sum(r.get("tokens", {}).get("total", 0) for r in records)
     total_ret = sum(r.get("retries", 0) for r in records)
+    total_cost = sum(r.get("cost_rub", 0) for r in records)
     budget = sum(1 for r in records if r.get("escalated_reason") == "budget_exceeded")
+    escalated = sum(1 for r in records if r.get("outcome") == "escalated")
     print(f"Успешность: {ok}/{total} ({ok * 100 / total:.1f}%)")
-    print(f"Суммарно: время {total_dur:.2f}с, токенов {total_tok}, "
+    print(f"Суммарно: время {total_dur:.2f}с, токенов {total_tok}, стоимость {total_cost:.4f}₽, "
           f"ретраев {total_ret}, эскалаций по бюджету {budget}")
+    alert = check_error_alert(escalated, total)
+    if alert:
+        print(alert)
     return 0
 
 
@@ -1280,7 +1351,7 @@ def _gen_call_count(chat: FakeLLM) -> int:
 
 
 def selftest() -> int:
-    """10 проверок без LLM, без Qdrant и без сети (FakeLLM + мок Qdrant + TF-IDF)."""
+    """12 проверок без LLM, без Qdrant и без сети (FakeLLM + мок Qdrant + TF-IDF)."""
     failures: list[str] = []
 
     def check(name: str, fn: Callable[[], None]) -> None:
@@ -1325,6 +1396,14 @@ def selftest() -> int:
         assert result.memory_saved is True
         assert "doc-certificate" in result.sources, f"sources: {result.sources}"
         assert metrics.success is True and metrics.outcome == Outcome.ANSWERED
+        expected_cost = round(
+            metrics.prompt_tokens * LLM_COST_INPUT_PER_1M_RUB / 1_000_000
+            + metrics.completion_tokens * LLM_COST_OUTPUT_PER_1M_RUB / 1_000_000,
+            6,
+        )
+        assert metrics.cost_rub == expected_cost, (
+            f"стоимость: {metrics.cost_rub} != {expected_cost}"
+        )
         qa_data = _load_qa_file(env["qa_path"])
         qa_nodes = [n for n in qa_data["nodes"] if n["type"] == "qa"]
         assert len(qa_nodes) == 1, f"qa-узлы: {qa_data['nodes']}"
@@ -1400,6 +1479,7 @@ def selftest() -> int:
         assert metrics.budget_violated is True
         records = run_log.read()
         assert records and records[-1]["llm_calls"] == 4, f"лог: {records}"
+        assert "cost_rub" in records[-1], f"в записи нет стоимости: {records[-1]}"
 
     # 9. Retry: flaky (первые 2 вызова — сетевая ошибка) → прогон завершён успешно.
     def t9_retry() -> None:
@@ -1421,6 +1501,34 @@ def selftest() -> int:
         # classify + 3×generate (check_answer детерминированно отвергает каждый раз).
         assert metrics.llm_calls == 4, f"вызовов: {metrics.llm_calls}"
 
+    # 11. Ротация лога: файл не растёт за max_records, переполненный файл —
+    #     целиком в архив .1, новый лог — с новой записи.
+    def t11_log_rotation() -> None:
+        log_path = os.path.join(tempfile.mkdtemp(prefix="dz6-selftest-rot-"), "runs.jsonl")
+        run_log = RunLog(log_path, max_records=3)
+        for i in range(4):
+            run_log.append({"i": i})
+        assert [r["i"] for r in run_log.read()] == [3], "после ротации файл не новый"
+        assert [r["i"] for r in RunLog(log_path + ".1").read()] == [0, 1, 2], "архив не полный"
+        # Вторая ротация: архив заменяется, а не накапливается.
+        for i in range(4, 7):
+            run_log.append({"i": i})
+        assert [r["i"] for r in run_log.read()] == [6], "вторая ротация не сработала"
+        assert [r["i"] for r in RunLog(log_path + ".1").read()] == [3, 4, 5], "архив накопился"
+        # Лимит 0 — ротация выключена.
+        no_rot = os.path.join(tempfile.mkdtemp(prefix="dz6-selftest-rot-"), "runs.jsonl")
+        for i in range(5):
+            RunLog(no_rot, max_records=0).append({"i": i})
+        assert len(RunLog(no_rot).read()) == 5, "ротация сработала при max_records=0"
+
+    # 12. Алерт: доля эскалаций выше порога (20%) → текст алерта, ниже → тишина.
+    def t12_error_alert() -> None:
+        assert check_error_alert(0, 4, 0.2) is None
+        assert check_error_alert(2, 10, 0.2) is None  # ровно 20% — порог не «превышен»
+        assert check_error_alert(3, 10, 0.2) is not None  # 30% > 20%
+        assert check_error_alert(1, 4, 0.2) is not None
+        assert check_error_alert(0, 0, 0.2) is None  # пустой лог — алерта нет
+
     check("граф валиден: все 13 состояний достижимы, переходов в «фантазии» нет", t1_graph_valid)
     check("success path: точный trace с check_answer, ответ, сохранение в память", t2_success_path)
     check("ветка «нет контекста»: отказ, память не пополняется", t3_refuse_branch)
@@ -1431,6 +1539,8 @@ def selftest() -> int:
     check("бюджет: budget_exceeded, ровно 4 LLM-вызова, запись в лог", t8_budget)
     check("retry: сетевые ошибки пережиты (3 попытки), прогон успешен", t9_retry)
     check("check_answer: галлюцинированный источник → answer_check_failed", t10_check_answer)
+    check("ротация лога: runs.jsonl не растёт за лимит, архив <файл>.1", t11_log_rotation)
+    check("алерт: доля эскалаций выше порога 20% → алерт", t12_error_alert)
 
     if failures:
         print(f"SELF-TEST: {len(failures)} упало: {', '.join(failures)}")
