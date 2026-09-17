@@ -234,8 +234,9 @@ build_scenario(meter, kb, memory, qmem, qa_path, config)  →  Workflow(13 со�
   |  BudgetExceeded в action → escalate (budget_exceeded);
   |  другое исключение → escalate (step_error:<state>) — не падение
   |
-  |  5 рабочих шагов:      classify → retrieve → generate → validate → save
-  |  (retrieve — векторный поиск top-3 по Qdrant/моку)
+   |  5 рабочих шагов:      classify → retrieve → generate → validate → save
+   |  (retrieve — векторный поиск top-3 по Qdrant/моку; скор ограничен [0, 1]:
+   |   отрицательный косинус обрезается до 0)
   |  5 точек ветвления:    check_memory / classify(risk) / check_relevance /
   |                        check_answer / check_validation (ретрай-цикл с лимитом)
   |  4 терминальных:       finish / refuse / escalate / finish_cached

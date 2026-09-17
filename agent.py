@@ -886,8 +886,11 @@ def build_scenario(
     def _act_retrieve(ctx: WorkflowContext) -> None:
         docs_by_id = {d.doc_id: d for d in kb}
         results = qmem.search(ctx.query, top_k=3)
+        # Косинусное сходство может быть отрицательным — ограничиваем скор
+        # до [0, 1]: пороги и выводы работают в фиксированном диапазоне.
         ctx.docs = [
-            RetrievedDoc(document=docs_by_id[doc_id], score=round(score, 3))
+            RetrievedDoc(document=docs_by_id[doc_id],
+                         score=round(min(1.0, max(0.0, score)), 3))
             for doc_id, score, _ in results
             if doc_id in docs_by_id
         ]
@@ -1412,7 +1415,8 @@ def selftest() -> int:
             for e in qa_data["edges"]
         ), f"ребро qa→doc-certificate не найдено: {qa_data['edges']}"
 
-    # 3. Ветка «нет контекста»: отказ, память не пополняется.
+    # 3. Ветка «нет контекста»: отказ, память не пополняется;
+    #    отрицательный косинус обрезается до [0, 1].
     def t3_refuse_branch() -> None:
         env = _selftest_env("default")
         result, _ = _execute(REFUSE_QUERY, env["workflow"], env["meter"])
@@ -1422,6 +1426,20 @@ def selftest() -> int:
         ], f"trace: {result.trace}"
         assert result.memory_saved is False
         assert _load_qa_file(env["qa_path"])["nodes"] == [], "память была пополнена"
+        # Отрицательный косинус (теоретически возможен): скор обрезают до
+        # [0, 1], ветка — refuse.
+        kb = load_documents(_resolve(KB_FILE))
+        class _NegScoreMem:
+            def search(self, query, top_k):
+                return [(kb[0].doc_id, -0.6, {}), (kb[1].doc_id, -0.1, {})]
+        wf = build_scenario(env["meter"], kb, env["memory"], _NegScoreMem(),
+                            env["qa_path"], ScenarioConfig())
+        ctx = WorkflowContext(query=REFUSE_QUERY)
+        result = wf.run(ctx)
+        assert result.outcome == Outcome.REFUSED, result.outcome
+        assert ctx.docs, "документы не сохранены в контекст"
+        for d in ctx.docs:
+            assert 0.0 <= d.score <= 1.0, f"score {d.score} не в [0, 1]"
 
     # 4. Провал валидации: ungrounded + retries=1 → grounding_validation_failed,
     #    бюджет не трогается (5 вызовов: classify + 2×(generate+validate) < 6).
