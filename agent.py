@@ -19,7 +19,11 @@
     - BudgetGuard — предохранитель MAX_LLM_CALLS_PER_RUN: превышение →
       эскалация budget_exceeded, а не падение;
     - RunLog — лог выполнения logs/runs.jsonl (JSONL, одна строка на прогон),
-      сводная таблица метрик в --demo и агрегаты в --report.
+      сводная таблица метрик в --demo и агрегаты в --report;
+    - алерт считает только *технические* эскалации: safety-эскалация
+      high_risk — штатное безопасное поведение, не ошибка;
+    - gold set (context/eval.json) + --eval — оценка качества ответов:
+      ожидаемые факты и источник на вопрос, а не только успешный outcome.
 
 Контекст — векторный поиск по базе знаний в Qdrant (Docker, паттерн DZ_4);
 память — граф прошлых Q&A (memory/qa.json).
@@ -34,7 +38,8 @@ TF-IDF-эмбеддером, поэтому самодиагностика ра�
     .venv/bin/python agent.py                 # интерактив
     .venv/bin/python agent.py "вопрос"         # один вопрос (+ строка метрик)
     .venv/bin/python agent.py --demo           # 4 прогона + сводная таблица
-    .venv/bin/python agent.py --selftest       # 12 проверок без LLM
+    .venv/bin/python agent.py --selftest       # 14 проверок без LLM
+    .venv/bin/python agent.py --eval           # gold set: качество ответов
     .venv/bin/python agent.py --report         # агрегаты по logs/runs.jsonl
     .venv/bin/python agent.py --show-trace "вопрос"
 """
@@ -72,6 +77,8 @@ LLM_REQUEST_TIMEOUT_SECONDS = int(os.getenv("LLM_REQUEST_TIMEOUT_SECONDS", "120"
 
 KB_FILE = os.getenv("KB_FILE", "context/kb.json")
 QA_MEMORY_FILE = os.getenv("QA_MEMORY_FILE", "memory/qa.json")
+# Gold set для оценки качества ответов (--eval): вопросы + ожидаемые факты.
+EVAL_FILE = os.getenv("EVAL_FILE", "context/eval.json")
 
 # Векторный поиск (Qdrant, паттерн DZ_4)
 QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
@@ -111,6 +118,25 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "ERROR")
 logger = logging.getLogger("dz6.agent")
 
 END = "END"  # маркер: сценарий завершён
+
+# --- Классификация эскалаций --------------------------------------------------
+# Safety-эскалации — штатное безопасное поведение агента (ветка risk=high),
+# не ошибка: в алерт и «технические ошибки» не входят. Всё остальное —
+# техническая ошибка (сбой состояния, бюджет, гард, провал валидаций).
+
+SAFETY_ESCALATION_REASONS = frozenset({"high_risk"})
+
+
+def is_safety_escalation(reason: Optional[str]) -> bool:
+    """Штатная safety/business-эскалация (high_risk) — не ошибка."""
+    return reason in SAFETY_ESCALATION_REASONS
+
+
+def is_technical_escalation(reason: Optional[str]) -> bool:
+    """Техническая ошибка (step_error:*, budget_exceeded, max_steps,
+    classification_failed, grounding_validation_failed, answer_check_failed) —
+    требует внимания."""
+    return reason is not None and not is_safety_escalation(reason)
 
 
 def _resolve(path: str) -> str:
@@ -819,13 +845,17 @@ class Workflow:
 # Сценарий: тикет поддержки (5 шагов + 5 ветвлений, 13 состояний)
 # --------------------------------------------------------------------------- #
 
-def _answer_problem(answer: str, known_ids: set[str], max_chars: int) -> Optional[str]:
+def _answer_problem(answer: str, known_ids: set[str], retrieved_ids: set[str],
+                    max_chars: int) -> Optional[str]:
     """Детерминированная проверка ответа. Возвращает причину провала или None.
 
     - ответ непустой;
     - длина <= max_chars;
     - id в блоке [источники: …] существуют в базе знаний
-      (защита от «галлюцинированных» источников).
+      (защита от «галлюцинированных» источников);
+    - id в блоке [источники: …] — среди документов, реально полученных
+      текущим поиском (top-k): модель может цитировать только то,
+      что увидела в контексте.
     """
     if not answer.strip():
         return "ответ пуст"
@@ -838,6 +868,9 @@ def _answer_problem(answer: str, known_ids: set[str], max_chars: int) -> Optiona
         unknown = [t for t in cited if t not in known_ids]
         if unknown:
             return f"в источниках несуществующие id: {', '.join(unknown)}"
+        stale = [t for t in cited if t not in retrieved_ids]
+        if stale:
+            return f"источники не получены текущим поиском: {', '.join(stale)}"
     return None
 
 
@@ -925,7 +958,11 @@ def build_scenario(
 
     # -- check_answer: детерминированная проверка ответа (без LLM) --------------
     def _act_check_answer(ctx: WorkflowContext) -> None:
-        reason = _answer_problem(ctx.answer, known_doc_ids, config.max_answer_chars)
+        # Источники сверяем и с БЗ (галлюцинации), и с топ-k текущего поиска —
+        # модель видела в контексте только эти документы.
+        retrieved_ids = {d.document.doc_id for d in ctx.docs}
+        reason = _answer_problem(ctx.answer, known_doc_ids, retrieved_ids,
+                                 config.max_answer_chars)
         if reason:
             # Провал оформляем как валидационный — ретраи работают как обычно,
             # а причина финальной эскалации будет answer_check_failed.
@@ -1132,6 +1169,160 @@ def log_run(run_log: RunLog, query: str, result: AgentResult,
 
 
 # --------------------------------------------------------------------------- #
+# Оценка качества ответов: gold set (вопросы + ожидаемые факты)
+# --------------------------------------------------------------------------- #
+
+@dataclass(frozen=True)
+class EvalCase:
+    """Gold-кейс: вопрос, ожидаемый итог, ожидаемые факты ответа и источник."""
+    id: str
+    query: str
+    expect_outcome: str  # "answered" (включая answered_cached) | "refused" | "escalated"
+    expect_facts: tuple[str, ...]
+    expect_source: Optional[str]
+
+
+@dataclass
+class EvalCaseResult:
+    """Результат прогона gold-кейса: итог, доля фактов, источник, стоимость."""
+    case: EvalCase
+    result: Optional[AgentResult]
+    metrics: Optional[RunMetrics]
+    facts_matched: int
+    facts_total: int
+    source_ok: bool
+    passed: bool
+    error: Optional[str] = None
+
+
+def load_eval_cases(path: str) -> list[EvalCase]:
+    """Загружает gold set и валидирует его (известный outcome, непустые вопросы)."""
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    cases: list[EvalCase] = []
+    for c in data.get("cases", []):
+        outcome = c["expect_outcome"]
+        if outcome not in ("answered", "refused", "escalated"):
+            raise ValueError(f"кейс {c.get('id')}: неизвестный expect_outcome «{outcome}»")
+        if not str(c.get("query", "")).strip():
+            raise ValueError(f"кейс {c.get('id')}: пустой вопрос")
+        cases.append(EvalCase(
+            id=str(c["id"]),
+            query=str(c["query"]),
+            expect_outcome=outcome,
+            expect_facts=tuple(c.get("expect_facts", [])),
+            expect_source=c.get("expect_source"),
+        ))
+    if not cases:
+        raise ValueError(f"gold set пуст: {path}")
+    return cases
+
+
+def _normalize(text: str) -> str:
+    """Нормализация для сверки фактов: нижний регистр, схлопывание пробелов."""
+    return re.sub(r"\s+", " ", text.lower()).strip()
+
+
+def match_facts(answer: str, facts: list[str]) -> tuple[list[str], list[str]]:
+    """Какие ожидаемые факты (подстроки) есть в ответе. → (есть, отсутствуют)."""
+    a = _normalize(answer)
+    matched = [f for f in facts if _normalize(f) in a]
+    missed = [f for f in facts if _normalize(f) not in a]
+    return matched, missed
+
+
+def _outcome_ok(expect: str, actual: Outcome) -> bool:
+    """«answered» засчитывается и для answered, и для answered_cached."""
+    if expect == "answered":
+        return actual in (Outcome.ANSWERED, Outcome.ANSWERED_CACHED)
+    return actual.value == expect
+
+
+def run_eval(cases: list[EvalCase], workflow: Workflow,
+             meter: MeteredChat) -> list[EvalCaseResult]:
+    """Прогоняет gold set: по каждому кейсу — итог, факты, источник, метрики.
+
+    Кейс PASSED: ожидаемый итог + все ожидаемые факты в ответе +
+    ожидаемый источник в sources. Ошибка LLM — ERROR по кейсу, не падение.
+    """
+    results: list[EvalCaseResult] = []
+    for case in cases:
+        try:
+            result, metrics = _execute(case.query, workflow, meter)
+        except openai.APIError as e:
+            results.append(EvalCaseResult(
+                case=case, result=None, metrics=None,
+                facts_matched=0, facts_total=len(case.expect_facts),
+                source_ok=False, passed=False,
+                error=f"{e.__class__.__name__}: {str(e)[:200]}",
+            ))
+            continue
+        matched, _missed = match_facts(result.message, list(case.expect_facts))
+        facts_total = len(case.expect_facts)
+        source_ok = (case.expect_source in result.sources) if case.expect_source else True
+        passed = (_outcome_ok(case.expect_outcome, result.outcome)
+                  and len(matched) == facts_total and source_ok)
+        results.append(EvalCaseResult(
+            case=case, result=result, metrics=metrics,
+            facts_matched=len(matched), facts_total=facts_total,
+            source_ok=source_ok, passed=passed,
+        ))
+    return results
+
+
+def print_eval_report(results: list[EvalCaseResult]) -> int:
+    """Таблица по кейсам + сводка качества. Возвращает число не пройденных."""
+    print(f"{'№':<4}{'кейс':<14}{'итог':<18}{'факты':>7}{'источник':>10}"
+          f"{'стоимость':>12}  результат")
+    for i, er in enumerate(results, 1):
+        if er.result is None:
+            print(f"{i:<4}{er.case.id:<14}{'—':<18}{'—':>7}{'—':>10}{'—':>12}  "
+                  f"ERROR: {er.error}")
+            continue
+        facts = f"{er.facts_matched}/{er.facts_total}" if er.facts_total else "—"
+        source = "ок" if er.source_ok else "нет"
+        cost = f"{er.metrics.cost_rub:.4f}₽" if er.metrics else "—"
+        print(f"{i:<4}{er.case.id:<14}{er.result.outcome.value:<18}{facts:>7}"
+              f"{source:>10}{cost:>12}  {'PASS' if er.passed else 'FAIL'}")
+        if not er.passed:
+            if er.result.outcome.value != er.case.expect_outcome:
+                print(f"       итог: {er.result.outcome.value} "
+                      f"(ожидалось {er.case.expect_outcome})")
+            _, missed = match_facts(er.result.message, list(er.case.expect_facts))
+            if missed:
+                print(f"       нет фактов: {', '.join(missed)}")
+            if not er.source_ok:
+                print(f"       нет источника: {er.case.expect_source} "
+                      f"(фактически: {', '.join(er.result.sources) or '—'})")
+    total = len(results)
+    passed = sum(1 for er in results if er.passed)
+    f_total = sum(er.facts_total for er in results)
+    f_matched = sum(er.facts_matched for er in results)
+    facts_str = (f"{f_matched}/{f_total} ({f_matched * 100 / f_total:.1f}%)"
+                 if f_total else "—")
+    print(f"Итог: кейсов пройдено {passed}/{total} ({passed * 100 / total:.1f}%) "
+          f"| факты: {facts_str}")
+    return total - passed
+
+
+def run_eval_cli(kb: list[Document], qmem, raw_chat: RawChatFn) -> int:
+    """--eval: gold set в изолированной среде (tmp-память, без записи в лог)."""
+    cases = load_eval_cases(_resolve(EVAL_FILE))
+    qa_dir = tempfile.mkdtemp(prefix="dz6-eval-")
+    qa_path = os.path.join(qa_dir, "qa.json")
+    # Свежая память: doc-узлы из БЗ, qa-узлов нет — каждый кейс идёт
+    # полным пайплайном, не касаясь memory/qa.json и logs/runs.jsonl.
+    memory = build_runtime_memory(kb, qa_path)
+    meter = MeteredChat(raw_chat)
+    workflow = build_scenario(meter, kb, memory, qmem, qa_path, ScenarioConfig())
+    print(f"Оценка качества (gold set): {len(cases)} кейсов из "
+          f"{os.path.relpath(_resolve(EVAL_FILE), BASE_DIR)}; память и лог прогонов не трогаются")
+    results = run_eval(cases, workflow, meter)
+    failed = print_eval_report(results)
+    return 0 if failed == 0 else 1
+
+
+# --------------------------------------------------------------------------- #
 # Вывод и CLI
 # --------------------------------------------------------------------------- #
 
@@ -1174,34 +1365,41 @@ def print_metrics_table(runs: list[tuple[str, AgentResult, RunMetrics]]) -> None
     total = len(runs)
     ok = sum(1 for _, r, _ in runs if r.outcome in (Outcome.ANSWERED, Outcome.ANSWERED_CACHED))
     refused = sum(1 for _, r, _ in runs if r.outcome == Outcome.REFUSED)
-    errors = sum(1 for _, r, _ in runs if r.outcome == Outcome.ESCALATED)
+    escalated_reasons = [
+        r.escalated_reason for _, r, _ in runs if r.outcome == Outcome.ESCALATED
+    ]
+    safety = sum(1 for r in escalated_reasons if is_safety_escalation(r))
+    technical = sum(1 for r in escalated_reasons if is_technical_escalation(r))
     avg = sum(m.duration_s for _, _, m in runs) / total
     tokens = sum(m.total_tokens for _, _, m in runs)
     cost = sum(m.cost_rub for _, _, m in runs)
     retries = sum(m.retries for _, _, m in runs)
-    print(f"Успешность: {ok}/{total} ({ok * 100 / total:.1f}%) | отказов: {refused} | ошибок: {errors}")
+    print(f"Успешность: {ok}/{total} ({ok * 100 / total:.1f}%) | отказов: {refused} | "
+          f"safety-эскалаций: {safety} | тех. ошибок: {technical}")
     print(f"Среднее время: {avg:.2f}с | суммарные токены: {tokens} | "
           f"стоимость: {cost:.4f}₽ | ретраев: {retries}")
-    alert = check_error_alert(errors, total)
+    alert = check_error_alert(escalated_reasons, total)
     if alert:
         print(alert)
 
 
-def check_error_alert(escalated: int, total: int,
+def check_error_alert(escalated_reasons: list[Optional[str]], total: int,
                       threshold: float = ERROR_ALERT_THRESHOLD) -> Optional[str]:
-    """Алерт: доля прогонов, завершившихся эскалацией, выше порога.
+    """Алерт: доля прогонов с *технической* эскалацией выше порога.
 
-    Порог по умолчанию 0.2 (20%): например, в демо из 4 прогонов одна
-    запланированная эскалация (high_risk) — 25% — уже превышает порог;
-    при большом числе прогонов случайные сбои будут заметнее.
+    Safety-эскалации (high_risk) — штатное безопасное поведение агента — не
+    считаются ошибкой. Порог по умолчанию 0.2 (20%): при большом числе
+    прогонов случайные сбои будут заметнее.
     """
     if total == 0 or threshold <= 0:
         return None
-    share = escalated / total
+    technical = sum(1 for r in escalated_reasons if is_technical_escalation(r))
+    share = technical / total
     if share > threshold:
         return (
-            f"[АЛЕРТ] {share * 100:.1f}% прогонов завершилось эскалацией "
-            f"(порог {threshold * 100:.0f}%) — проверьте LLM и конфигурацию"
+            f"[АЛЕРТ] {share * 100:.1f}% прогонов завершилось технической "
+            f"эскалацией (порог {threshold * 100:.0f}%) — проверьте LLM и "
+            f"конфигурацию; safety-эскалации (high_risk) не учитываются"
         )
     return None
 
@@ -1239,11 +1437,16 @@ def report(path: str) -> int:
     total_ret = sum(r.get("retries", 0) for r in records)
     total_cost = sum(r.get("cost_rub", 0) for r in records)
     budget = sum(1 for r in records if r.get("escalated_reason") == "budget_exceeded")
-    escalated = sum(1 for r in records if r.get("outcome") == "escalated")
-    print(f"Успешность: {ok}/{total} ({ok * 100 / total:.1f}%)")
+    escalated_reasons = [
+        r.get("escalated_reason") for r in records if r.get("outcome") == "escalated"
+    ]
+    safety = sum(1 for r in escalated_reasons if is_safety_escalation(r))
+    technical = sum(1 for r in escalated_reasons if is_technical_escalation(r))
+    print(f"Успешность: {ok}/{total} ({ok * 100 / total:.1f}%) | "
+          f"safety-эскалаций: {safety} | тех. ошибок: {technical}")
     print(f"Суммарно: время {total_dur:.2f}с, токенов {total_tok}, стоимость {total_cost:.4f}₽, "
           f"ретраев {total_ret}, эскалаций по бюджету {budget}")
-    alert = check_error_alert(escalated, total)
+    alert = check_error_alert(escalated_reasons, total)
     if alert:
         print(alert)
     return 0
@@ -1354,7 +1557,7 @@ def _gen_call_count(chat: FakeLLM) -> int:
 
 
 def selftest() -> int:
-    """12 проверок без LLM, без Qdrant и без сети (FakeLLM + мок Qdrant + TF-IDF)."""
+    """14 проверок без LLM, без Qdrant и без сети (FakeLLM + мок Qdrant + TF-IDF)."""
     failures: list[str] = []
 
     def check(name: str, fn: Callable[[], None]) -> None:
@@ -1509,7 +1712,8 @@ def selftest() -> int:
         assert metrics.llm_calls == 5, f"вызовов: {metrics.llm_calls}"
 
     # 10. check_answer: badformat (doc-fake в источниках) → ретраи →
-    #     эскалация answer_check_failed, LLM-валидатор не вызывается.
+    #     эскалация answer_check_failed, LLM-валидатор не вызывается;
+    #     документ из БЗ, но не из топ-k текущего поиска — тоже отклоняется.
     def t10_check_answer() -> None:
         env = _selftest_env("badformat")
         result, metrics = _execute(HAPPY_QUERY, env["workflow"], env["meter"])
@@ -1518,6 +1722,19 @@ def selftest() -> int:
         assert "validate" not in result.trace, f"LLM-валидатор не должен вызываться: {result.trace}"
         # classify + 3×generate (check_answer детерминированно отвергает каждый раз).
         assert metrics.llm_calls == 4, f"вызовов: {metrics.llm_calls}"
+        # Retrieval-область: id существует в БЗ, но не получен текущим поиском
+        # → ответ отвергается (модель цитирует только то, что видела).
+        kb = load_documents(_resolve(KB_FILE))
+        all_ids = {d.doc_id for d in kb}
+        stale = next(d for d in kb if d.doc_id != "doc-certificate")
+        reason = _answer_problem(
+            f"Ответ. [источники: {stale.doc_id}]", all_ids, {"doc-certificate"}, 2000)
+        assert reason and "не получены текущим поиском" in reason, f"reason: {reason}"
+        reason = _answer_problem("Ответ. [источники: doc-fake]", all_ids, all_ids, 2000)
+        assert reason and "несуществующие id" in reason, f"reason: {reason}"
+        assert _answer_problem(
+            "Ответ. [источники: doc-certificate]", all_ids, {"doc-certificate"}, 2000
+        ) is None
 
     # 11. Ротация лога: файл не растёт за max_records, переполненный файл —
     #     целиком в архив .1, новый лог — с новой записи.
@@ -1539,13 +1756,64 @@ def selftest() -> int:
             RunLog(no_rot, max_records=0).append({"i": i})
         assert len(RunLog(no_rot).read()) == 5, "ротация сработала при max_records=0"
 
-    # 12. Алерт: доля эскалаций выше порога (20%) → текст алерта, ниже → тишина.
+    # 12. Алерт: считается доля *технических* эскалаций; safety (high_risk) —
+    #     штатное поведение, ошибкой не считается даже при большой доле.
     def t12_error_alert() -> None:
-        assert check_error_alert(0, 4, 0.2) is None
-        assert check_error_alert(2, 10, 0.2) is None  # ровно 20% — порог не «превышен»
-        assert check_error_alert(3, 10, 0.2) is not None  # 30% > 20%
-        assert check_error_alert(1, 4, 0.2) is not None
-        assert check_error_alert(0, 0, 0.2) is None  # пустой лог — алерта нет
+        assert check_error_alert([], 4, 0.2) is None
+        assert check_error_alert(["high_risk"], 4, 0.2) is None  # 25%, но safety
+        assert check_error_alert(["high_risk", "high_risk"], 4, 0.2) is None  # 50% safety
+        assert check_error_alert(["step_error:validate"], 4, 0.2) is not None
+        assert check_error_alert(  # 10% technical < 20%
+            ["high_risk", "grounding_validation_failed"], 10, 0.2) is None
+        assert check_error_alert(  # 30% technical > 20%
+            ["high_risk"] + ["max_steps"] * 3, 10, 0.2) is not None
+        assert check_error_alert([], 0, 0.2) is None  # пустой лог — алерта нет
+
+    # 13. Классификация эскалаций: high_risk — safety, всё остальное — technical.
+    def t13_escalation_kinds() -> None:
+        assert is_safety_escalation("high_risk")
+        assert not is_safety_escalation("step_error:generate")
+        assert not is_safety_escalation(None)
+        assert is_technical_escalation("step_error:generate")
+        assert is_technical_escalation("budget_exceeded")
+        assert is_technical_escalation("max_steps")
+        assert is_technical_escalation("classification_failed")
+        assert is_technical_escalation("grounding_validation_failed")
+        assert is_technical_escalation("answer_check_failed")
+        assert not is_technical_escalation("high_risk")
+        assert not is_technical_escalation(None)
+
+    # 14. Gold set: файл валиден (каждый факт — подстрока текста ожидаемого
+    #     источника в БЗ), harness на FakeLLM считает итоги, факты и источники.
+    def t14_gold_set() -> None:
+        cases = load_eval_cases(_resolve(EVAL_FILE))
+        assert len(cases) >= 4, f"кейсов мало: {len(cases)}"
+        docs = {d.doc_id: d for d in load_documents(_resolve(KB_FILE))}
+        for c in cases:
+            assert c.id and c.query.strip(), f"пустой кейс: {c}"
+            if c.expect_source:
+                doc = docs.get(c.expect_source)
+                assert doc, f"кейс {c.id}: источник {c.expect_source} нет в БЗ"
+                for fact in c.expect_facts:
+                    assert fact.lower() in doc.text.lower(), (
+                        f"кейс {c.id}: факт «{fact}» не найден в тексте {c.expect_source}")
+        # Harness на FakeLLM (default): итоги верные, счёт фактов и источников
+        # работает (универсальный ответ заглушки факты не содержит — и так и есть).
+        env = _selftest_env("default")
+        results = run_eval(cases, env["workflow"], env["meter"])
+        assert len(results) == len(cases), "результатов не по числу кейсов"
+        by_id = {er.case.id: er for er in results}
+        assert by_id["certificate"].result.outcome == Outcome.ANSWERED
+        assert by_id["off-topic"].result.outcome == Outcome.REFUSED
+        cert = by_id["certificate"]
+        assert cert.facts_total > 0 and cert.facts_matched < cert.facts_total, (
+            f"у FakeLLM факты не должны совпасть: {cert.facts_matched}/{cert.facts_total}")
+        assert cert.source_ok, "FakeLLM цитирует retrieved-документы — источник должен найтись"
+        assert by_id["off-topic"].passed, "refused-кейс без фактов должен проходить"
+        # Юнит match_facts: регистр и пробелы не мешают, отсутствующий факт — в missed.
+        m, ms = match_facts("Сертификат выдадут в личном кабинете за 5 рабочих дней",
+                            ["личном кабинете", "5 рабочих дней", "возврат"])
+        assert m == ["личном кабинете", "5 рабочих дней"] and ms == ["возврат"]
 
     check("граф валиден: все 13 состояний достижимы, переходов в «фантазии» нет", t1_graph_valid)
     check("success path: точный trace с check_answer, ответ, сохранение в память", t2_success_path)
@@ -1558,7 +1826,11 @@ def selftest() -> int:
     check("retry: сетевые ошибки пережиты (3 попытки), прогон успешен", t9_retry)
     check("check_answer: галлюцинированный источник → answer_check_failed", t10_check_answer)
     check("ротация лога: runs.jsonl не растёт за лимит, архив <файл>.1", t11_log_rotation)
-    check("алерт: доля эскалаций выше порога 20% → алерт", t12_error_alert)
+    check("алерт: учитываются только технические эскалации, safety — нет", t12_error_alert)
+    check("классификация эскалаций: high_risk — safety, остальное — technical",
+          t13_escalation_kinds)
+    check("gold set: факты валидны против БЗ, harness считает качество ответов",
+          t14_gold_set)
 
     if failures:
         print(f"SELF-TEST: {len(failures)} упало: {', '.join(failures)}")
@@ -1587,6 +1859,8 @@ def main() -> None:
     parser.add_argument("--selftest", action="store_true", help="самодиагностика без LLM")
     parser.add_argument("--report", action="store_true",
                         help="агрегированные метрики по логам runs.jsonl")
+    parser.add_argument("--eval", action="store_true",
+                        help="gold set: оценка качества ответов (нужны LLM и Qdrant)")
     parser.add_argument("--show-trace", action="store_true",
                         help="печатать путь по состояниям графа")
     args = parser.parse_args()
@@ -1602,7 +1876,8 @@ def main() -> None:
     memory = build_runtime_memory(kb, qa_path)
     client = openai.OpenAI(base_url=LLM_BASE_URL, api_key=LLM_API_KEY)
     qmem = make_vector_memory(client, kb)
-    meter = MeteredChat(make_openai_chat(client))
+    raw_chat = make_openai_chat(client)
+    meter = MeteredChat(raw_chat)
     workflow = build_scenario(meter, kb, memory, qmem, qa_path, ScenarioConfig())
     run_log = RunLog(_resolve(RUNS_LOG_FILE))
     print(
@@ -1611,6 +1886,8 @@ def main() -> None:
     )
 
     try:
+        if args.eval:
+            sys.exit(run_eval_cli(kb, qmem, raw_chat))
         if args.demo:
             run_demo(workflow, meter, run_log)
         elif args.question:
